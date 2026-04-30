@@ -1,12 +1,18 @@
 const USERNAME = "faisal";
 const PASSWORD = "yahya";
 const ADMIN_PASSWORD = "2782003";
+const SUPABASE_URL = "https://msnecpdscwqbxfdcvhdr.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1zbmVjcGRzY3dxYnhmZGN2aGRyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc1NTQ5MzcsImV4cCI6MjA5MzEzMDkzN30.lxnUBFuI2oUbbWoHPQfhLLzb87spVoHtETA5BqNETB4";
+const CLOUD_ROW_ID = "main";
 const STORAGE_KEY = "garment_tracker_data_v2";
 const OLD_STORAGE_KEY = "garment_tracker_data_v1";
 const REMEMBER_KEY = "garment_tracker_remembered";
 const SESSION_KEY = "garment_tracker_logged_in";
 
 const app = document.querySelector("#app");
+const supabaseClient = window.supabase
+  ? window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY)
+  : null;
 
 let state = {
   garments: [],
@@ -17,17 +23,53 @@ let searchTerm = "";
 let stockFilter = "all";
 let sortMode = "newest";
 let selectedGarmentId = null;
+let isApplyingCloudUpdate = false;
 
-function loadState() {
+async function loadState() {
   const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(OLD_STORAGE_KEY);
-  if (!saved) return;
+
+  if (saved) {
+    try {
+      state = JSON.parse(saved);
+      migrateState();
+    } catch {
+      state = { garments: [], buyers: [] };
+    }
+  }
+
+  if (!supabaseClient) {
+    saveLocalState();
+    return;
+  }
 
   try {
-    state = JSON.parse(saved);
-    migrateState();
-    saveState();
-  } catch {
-    state = { garments: [], buyers: [] };
+    const { data, error } = await supabaseClient
+      .from("app_state")
+      .select("data")
+      .eq("id", CLOUD_ROW_ID)
+      .maybeSingle();
+
+    if (error) throw error;
+
+    if (data && data.data) {
+      const localHasData = Boolean((state.garments && state.garments.length) || (state.buyers && state.buyers.length));
+      const cloudHasData = Boolean((data.data.garments && data.data.garments.length) || (data.data.buyers && data.data.buyers.length));
+
+      if (localHasData && !cloudHasData) {
+        await saveState();
+        return;
+      }
+
+      state = data.data;
+      migrateState();
+      saveLocalState();
+      return;
+    }
+
+    await saveState();
+  } catch (error) {
+    console.warn("Supabase load failed. Using local data.", error);
+    saveLocalState();
   }
 }
 
@@ -68,8 +110,52 @@ function migrateState() {
   ])].sort((a, b) => a.localeCompare(b, "ar"));
 }
 
-function saveState() {
+function saveLocalState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+}
+
+async function saveState() {
+  saveLocalState();
+  if (!supabaseClient || isApplyingCloudUpdate) return;
+
+  try {
+    const { error } = await supabaseClient
+      .from("app_state")
+      .upsert({
+        id: CLOUD_ROW_ID,
+        data: state,
+        updated_at: new Date().toISOString()
+      });
+
+    if (error) throw error;
+  } catch (error) {
+    console.warn("Supabase save failed. Data is saved locally only.", error);
+  }
+}
+
+function subscribeToCloudState() {
+  if (!supabaseClient) return;
+
+  supabaseClient
+    .channel("app-state-sync")
+    .on(
+      "postgres_changes",
+      { event: "*", schema: "public", table: "app_state", filter: `id=eq.${CLOUD_ROW_ID}` },
+      (payload) => {
+        if (!payload.new || !payload.new.data) return;
+        const incoming = payload.new.data;
+        if (JSON.stringify(incoming) === JSON.stringify(state)) return;
+
+        isApplyingCloudUpdate = true;
+        state = incoming;
+        migrateState();
+        saveLocalState();
+        isApplyingCloudUpdate = false;
+
+        if (isLoggedIn()) renderApp();
+      }
+    )
+    .subscribe();
 }
 
 function isLoggedIn() {
@@ -269,10 +355,9 @@ function renderApp() {
       <header class="topbar">
         <div class="brand">
           <span>hasinah garments</span>
-          <small>فكرة وتخطيط العم فيصل</small>
         </div>
         <div class="top-actions">
-          <button class="secondary-btn" id="exportBtn">تصدير CSV</button>
+          <button class="secondary-btn" id="exportBtn">تصدير Excel</button>
           <button class="secondary-btn" id="logoutBtn">تسجيل الخروج</button>
         </div>
       </header>
@@ -350,7 +435,7 @@ function renderApp() {
   `;
 
   document.querySelector("#logoutBtn").addEventListener("click", logout);
-  document.querySelector("#exportBtn").addEventListener("click", exportCsv);
+  document.querySelector("#exportBtn").addEventListener("click", exportExcel);
   document.querySelector("#addGarmentBtn").addEventListener("click", openAddModal);
   document.querySelector("#searchInput").addEventListener("input", (event) => {
     searchTerm = event.target.value;
@@ -830,56 +915,241 @@ function deleteSelectedGarment() {
   renderApp();
 }
 
-function exportCsv() {
+function exportExcel() {
   try {
-    const rows = [
-      ["section", "type", "garment", "code", "yards_left", "buyer", "movement_yards", "note", "date"],
-      ...state.garments.map((garment) => [
-        "inventory",
-        "stock",
-        garment.name,
-        garment.code,
-        garment.yards,
-        "",
-        "",
-        garment.notes,
-        garment.createdAt
-      ]),
-      ...state.garments.flatMap((garment) => garment.history.map((item) => [
-        "history",
-        item.type,
-        garment.name,
-        garment.code,
-        garment.yards,
-        item.buyer,
-        item.yards,
-        item.note,
-        item.date
-      ]))
-    ];
-
-    const csv = `sep=,\n${rows.map((row) => row.map(csvCell).join(",")).join("\n")}`;
-    const blob = new Blob([`\uFEFF${csv}`], { type: "text/csv;charset=utf-8" });
+    const report = buildExcelReport();
+    const blob = new Blob([`\uFEFF${report}`], { type: "application/vnd.ms-excel;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     const today = new Date().toISOString().slice(0, 10);
 
     link.href = url;
-    link.download = `amo-yahya-garments-${today}.csv`;
+    link.download = `hasinah-garments-report-${today}.xls`;
     link.style.display = "none";
     document.body.appendChild(link);
     link.click();
     link.remove();
 
     setTimeout(() => URL.revokeObjectURL(url), 1000);
-    alert("تم تجهيز ملف CSV. إذا لم يظهر التحميل، تأكد أن المتصفح يسمح بالتنزيلات.");
+    alert("تم تجهيز ملف Excel. إذا لم يظهر التحميل، تأكد أن المتصفح يسمح بالتنزيلات.");
   } catch (error) {
-    alert("تعذر تصدير ملف CSV. حاول مرة أخرى.");
+    alert("تعذر تصدير ملف Excel. حاول مرة أخرى.");
   }
 }
 
-function csvCell(value) {
-  return `"${String(value ?? "").replaceAll('"', '""')}"`;
+function buildExcelReport() {
+  const today = new Date().toLocaleDateString("ar-SA");
+  const garmentRows = state.garments.map((garment, index) => {
+    const yards = Number(garment.yards || 0);
+    const image = garment.image
+      ? `<img class="garment-image" src="${garment.image}" alt="">`
+      : `<span class="no-image">لا توجد صورة</span>`;
+
+    return `
+      <tr>
+        <td>${index + 1}</td>
+        <td>${image}</td>
+        <td class="name-cell">${excelHtml(garment.name)}</td>
+        <td>${excelHtml(garment.code)}</td>
+        <td class="${stockClass(yards)}">${moneyNumber(yards)}</td>
+        <td>${excelHtml(stockLabel(yards))}</td>
+        <td>${excelHtml(garment.notes || "")}</td>
+      </tr>
+    `;
+  }).join("");
+
+  const historyRows = state.garments.flatMap((garment) => {
+    return garment.history.map((item) => `
+      <tr>
+        <td>${excelHtml(item.type === "restock" ? "إضافة مخزون" : "بيع")}</td>
+        <td>${excelHtml(garment.name)}</td>
+        <td>${excelHtml(garment.code)}</td>
+        <td>${excelHtml(item.buyer || "-")}</td>
+        <td>${moneyNumber(item.yards)}</td>
+        <td>${excelHtml(item.note || "")}</td>
+        <td>${excelHtml(new Date(item.date).toLocaleString("ar-SA"))}</td>
+      </tr>
+    `);
+  }).join("");
+
+  const buyerRows = buyerTotals().map((buyer) => `
+    <tr>
+      <td class="name-cell">${excelHtml(buyer.buyer)}</td>
+      <td>${moneyNumber(buyer.yards)}</td>
+      <td>${moneyNumber(buyer.garmentCount)}</td>
+      <td>${moneyNumber(buyer.count)}</td>
+      <td>${buyer.garments.map((garment) => `${excelHtml(garment.name)}: ${moneyNumber(garment.yards)} يارد`).join("<br>")}</td>
+    </tr>
+  `).join("");
+
+  return `
+    <!doctype html>
+    <html lang="ar" dir="rtl">
+    <head>
+      <meta charset="utf-8">
+      <style>
+        body {
+          direction: rtl;
+          font-family: "Segoe UI", Tahoma, Arial, sans-serif;
+          color: #172033;
+        }
+        h1 {
+          margin: 0;
+          padding: 18px;
+          color: #ffffff;
+          background: #111827;
+          font-size: 28px;
+          text-align: center;
+        }
+        h2 {
+          margin: 24px 0 10px;
+          color: #0f172a;
+          font-size: 20px;
+        }
+        .summary {
+          margin: 14px 0 20px;
+          border-collapse: collapse;
+          width: 100%;
+        }
+        .summary td {
+          padding: 14px;
+          border: 1px solid #d7dee9;
+          background: #f6f8fb;
+          font-size: 16px;
+          font-weight: 700;
+        }
+        table {
+          width: 100%;
+          border-collapse: collapse;
+          table-layout: fixed;
+        }
+        th {
+          padding: 12px;
+          color: #ffffff;
+          background: #1f3b57;
+          border: 1px solid #d7dee9;
+          font-size: 15px;
+          text-align: center;
+        }
+        td {
+          padding: 10px;
+          border: 1px solid #d7dee9;
+          background: #ffffff;
+          text-align: center;
+          vertical-align: middle;
+          font-size: 14px;
+          mso-number-format: "\\@";
+        }
+        tr:nth-child(even) td {
+          background: #f8fafc;
+        }
+        .name-cell {
+          font-weight: 700;
+          color: #0f172a;
+        }
+        .stock-green {
+          color: #047857;
+          background: #ecfdf5 !important;
+          font-weight: 800;
+        }
+        .stock-yellow {
+          color: #92400e;
+          background: #fffbeb !important;
+          font-weight: 800;
+        }
+        .stock-red {
+          color: #be123c;
+          background: #fff1f2 !important;
+          font-weight: 800;
+        }
+        .garment-image {
+          max-width: 96px;
+          max-height: 96px;
+          border: 1px solid #d7dee9;
+        }
+        .no-image {
+          color: #64748b;
+          font-size: 12px;
+        }
+        .footer {
+          margin-top: 20px;
+          color: #64748b;
+          font-size: 12px;
+          text-align: center;
+        }
+      </style>
+    </head>
+    <body>
+      <h1>hasinah garments</h1>
+      <table class="summary">
+        <tr>
+          <td>تاريخ التقرير: ${excelHtml(today)}</td>
+          <td>عدد الأقمشة: ${moneyNumber(state.garments.length)}</td>
+          <td>الياردات المتبقية: ${moneyNumber(totalYards())}</td>
+          <td>الياردات المباعة: ${moneyNumber(totalSold())}</td>
+          <td>قارب على النفاد: ${moneyNumber(lowStockCount())}</td>
+        </tr>
+      </table>
+
+      <h2>المخزون</h2>
+      <table>
+        <thead>
+          <tr>
+            <th style="width: 45px;">#</th>
+            <th style="width: 120px;">الصورة</th>
+            <th>اسم القماش</th>
+            <th>كود المصنع</th>
+            <th>الياردات المتبقية</th>
+            <th>حالة المخزون</th>
+            <th>ملاحظات</th>
+          </tr>
+        </thead>
+        <tbody>${garmentRows || `<tr><td colspan="7">لا توجد أقمشة</td></tr>`}</tbody>
+      </table>
+
+      <h2>ملخص العملاء</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>العميل</th>
+            <th>إجمالي الياردات</th>
+            <th>عدد أنواع الأقمشة</th>
+            <th>عدد العمليات</th>
+            <th>تفصيل الأقمشة</th>
+          </tr>
+        </thead>
+        <tbody>${buyerRows || `<tr><td colspan="5">لا توجد عمليات بيع</td></tr>`}</tbody>
+      </table>
+
+      <h2>سجل الحركات</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>النوع</th>
+            <th>اسم القماش</th>
+            <th>كود المصنع</th>
+            <th>العميل</th>
+            <th>الياردات</th>
+            <th>ملاحظة</th>
+            <th>التاريخ</th>
+          </tr>
+        </thead>
+        <tbody>${historyRows || `<tr><td colspan="7">لا توجد حركات</td></tr>`}</tbody>
+      </table>
+
+      <div class="footer">حقوق يحيى المفلحي شركة ركن حسينة</div>
+    </body>
+    </html>
+  `;
+}
+
+function excelHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
 }
 
 function closeModal() {
@@ -896,9 +1166,15 @@ function readImage(file) {
   });
 }
 
-loadState();
-if (isLoggedIn()) {
-  renderApp();
-} else {
-  renderLogin();
+async function startApp() {
+  await loadState();
+  subscribeToCloudState();
+
+  if (isLoggedIn()) {
+    renderApp();
+  } else {
+    renderLogin();
+  }
 }
+
+startApp();
