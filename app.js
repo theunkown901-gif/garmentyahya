@@ -1,5 +1,5 @@
 const USERNAME = "faisal";
-const PASSWORD = "yahya";
+const PASSWORD = "Ff054488";
 const ADMIN_PASSWORD = "2782003";
 const SUPABASE_URL = "https://msnecpdscwqbxfdcvhdr.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1zbmVjcGRzY3dxYnhmZGN2aGRyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc1NTQ5MzcsImV4cCI6MjA5MzEzMDkzN30.lxnUBFuI2oUbbWoHPQfhLLzb87spVoHtETA5BqNETB4";
@@ -8,6 +8,7 @@ const STORAGE_KEY = "garment_tracker_data_v2";
 const OLD_STORAGE_KEY = "garment_tracker_data_v1";
 const REMEMBER_KEY = "garment_tracker_remembered";
 const SESSION_KEY = "garment_tracker_logged_in";
+const SESSION_VERSION_KEY = "garment_tracker_session_version";
 
 const app = document.querySelector("#app");
 const supabaseClient = window.supabase
@@ -16,7 +17,10 @@ const supabaseClient = window.supabase
 
 let state = {
   garments: [],
-  buyers: []
+  buyers: [],
+  security: {
+    loginVersion: 1
+  }
 };
 
 let searchTerm = "";
@@ -24,6 +28,16 @@ let stockFilter = "all";
 let sortMode = "newest";
 let selectedGarmentId = null;
 let isApplyingCloudUpdate = false;
+
+function hasBusinessData(data) {
+  return Boolean(
+    (data.garments && data.garments.length) ||
+    (data.buyers && data.buyers.length) ||
+    (data.dresses && data.dresses.length) ||
+    (data.orders && data.orders.length) ||
+    (data.dressOrders && data.dressOrders.length)
+  );
+}
 
 async function loadState() {
   const saved = localStorage.getItem(STORAGE_KEY) || localStorage.getItem(OLD_STORAGE_KEY);
@@ -52,8 +66,8 @@ async function loadState() {
     if (error) throw error;
 
     if (data && data.data) {
-      const localHasData = Boolean((state.garments && state.garments.length) || (state.buyers && state.buyers.length));
-      const cloudHasData = Boolean((data.data.garments && data.data.garments.length) || (data.data.buyers && data.data.buyers.length));
+      const localHasData = hasBusinessData(state);
+      const cloudHasData = hasBusinessData(data.data);
 
       if (localHasData && !cloudHasData) {
         await saveState();
@@ -74,6 +88,11 @@ async function loadState() {
 }
 
 function migrateState() {
+  state.security = state.security || {};
+  if (!Number.isFinite(Number(state.security.loginVersion))) {
+    state.security.loginVersion = 1;
+  }
+
   state.garments = (state.garments || []).map((garment) => {
     const history = (garment.history || []).map((item) => ({
       id: item.id || crypto.randomUUID(),
@@ -119,6 +138,23 @@ async function saveState() {
   if (!supabaseClient || isApplyingCloudUpdate) return;
 
   try {
+    if (!hasBusinessData(state)) {
+      const { data: cloudRow, error: cloudError } = await supabaseClient
+        .from("app_state")
+        .select("data")
+        .eq("id", CLOUD_ROW_ID)
+        .maybeSingle();
+
+      if (cloudError) throw cloudError;
+
+      if (cloudRow && hasBusinessData(cloudRow.data)) {
+        const security = state.security || cloudRow.data.security || { loginVersion: 1 };
+        state = { ...cloudRow.data, security };
+        migrateState();
+        saveLocalState();
+      }
+    }
+
     const { error } = await supabaseClient
       .from("app_state")
       .upsert({
@@ -145,6 +181,7 @@ function subscribeToCloudState() {
         if (!payload.new || !payload.new.data) return;
         const incoming = payload.new.data;
         if (JSON.stringify(incoming) === JSON.stringify(state)) return;
+        const hadLoginBeforeUpdate = hasLoginFlag();
 
         isApplyingCloudUpdate = true;
         state = incoming;
@@ -152,28 +189,68 @@ function subscribeToCloudState() {
         saveLocalState();
         isApplyingCloudUpdate = false;
 
+        if (hadLoginBeforeUpdate && !isLoggedIn()) {
+          clearLoginState();
+          renderLogin();
+          return;
+        }
+
         if (isLoggedIn()) renderApp();
       }
     )
     .subscribe();
 }
 
-function isLoggedIn() {
+function currentLoginVersion() {
+  return String((state.security && state.security.loginVersion) || 1);
+}
+
+function hasLoginFlag() {
   return sessionStorage.getItem(SESSION_KEY) === "yes" || localStorage.getItem(REMEMBER_KEY) === "yes";
 }
 
+function isLoggedIn() {
+  if (!hasLoginFlag()) return false;
+
+  const savedVersion = sessionStorage.getItem(SESSION_VERSION_KEY) || localStorage.getItem(SESSION_VERSION_KEY);
+  return savedVersion === currentLoginVersion();
+}
+
 function setLoggedIn(remember) {
+  const version = currentLoginVersion();
   sessionStorage.setItem(SESSION_KEY, "yes");
+  sessionStorage.setItem(SESSION_VERSION_KEY, version);
   if (remember) {
     localStorage.setItem(REMEMBER_KEY, "yes");
+    localStorage.setItem(SESSION_VERSION_KEY, version);
   } else {
     localStorage.removeItem(REMEMBER_KEY);
+    localStorage.removeItem(SESSION_VERSION_KEY);
   }
 }
 
-function logout() {
+function clearLoginState() {
   sessionStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(REMEMBER_KEY);
+  sessionStorage.removeItem(SESSION_VERSION_KEY);
+  localStorage.removeItem(SESSION_VERSION_KEY);
+}
+
+function logout() {
+  clearLoginState();
+  renderLogin();
+}
+
+async function logoutAllDevices() {
+  if (!requireAdminPassword("تسجيل خروج كل الأجهزة")) return;
+
+  const sure = confirm("سيتم تسجيل خروج كل الأجهزة التي تستخدم هذا الموقع. هل تريد المتابعة؟");
+  if (!sure) return;
+
+  state.security = state.security || {};
+  state.security.loginVersion = Number(state.security.loginVersion || 1) + 1;
+  await saveState();
+  clearLoginState();
   renderLogin();
 }
 
@@ -358,6 +435,7 @@ function renderApp() {
         </div>
         <div class="top-actions">
           <button class="secondary-btn" id="exportBtn">تصدير Excel</button>
+          <button class="danger-btn" id="logoutAllBtn">تسجيل خروج كل الأجهزة</button>
           <button class="secondary-btn" id="logoutBtn">تسجيل الخروج</button>
         </div>
       </header>
@@ -435,6 +513,7 @@ function renderApp() {
   `;
 
   document.querySelector("#logoutBtn").addEventListener("click", logout);
+  document.querySelector("#logoutAllBtn").addEventListener("click", logoutAllDevices);
   document.querySelector("#exportBtn").addEventListener("click", exportExcel);
   document.querySelector("#addGarmentBtn").addEventListener("click", openAddModal);
   document.querySelector("#searchInput").addEventListener("input", (event) => {
